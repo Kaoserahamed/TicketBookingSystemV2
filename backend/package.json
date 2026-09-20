@@ -1,6 +1,6 @@
 {
   "name": "ticket-booking-backend",
-  "version": "0.1.0",
+  "version": "0.1.2",
   "private": true,
   "description": "Express.js API for the Ticket Booking System (see docs/02-system-architecture.md)",
   "main": "src/index.js",
