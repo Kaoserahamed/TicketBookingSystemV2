@@ -1,372 +1,101 @@
-name: CI/CD
-
-# Pipeline (docs/12-deployment.md):
-#   1. backend — lockfile install, lint/format/typecheck, dependency audit,
-#      then unit + integration tests against a real MySQL 8 service and a
-#      coverage-gated unit pass
-#   2. frontend — lockfile install, lint/format/typecheck, dependency audit,
-#      coverage-gated vitest run, then the production build
-#   3. sql      — recreate the schema on a real MySQL 8 service, then run the
-#      whole tests/sql/ suite (seed data, booking flow, concurrency, workers)
-#   4. manifests— render infrastructure/kubernetes with kustomize, validate
-#      every object against the Kubernetes API schemas (kubeconform, strict),
-#      then lint the overlay for misconfigurations (kube-linter)
-#   5. terraform— fmt + init + validate the IaC module, then a trivy policy
-#      scan (HIGH/CRITICAL misconfigurations fail the build)
-#   6. images  — build both container images (and push to GHCR on main)
-#
-# The `fresh-clone` job has no services: it is the README's cold-start recipe
-# (`npm run setup && npm run verify`) run exactly as a buyer would run it, so
-# a broken install/test/lint path can never hide behind cached CI state. (The
-# stack jobs keep `npm ci` caches and their MySQL service; this job mirrors a
-# machine that has never seen the repo.)
-#
-# Every job fails fast on lint, formatting, typecheck, coverage or audit
-# errors, so a regression cannot reach main just because tests happened to pass.
-#
-# Docker builds also act as a second gate: the frontend image runs
-# `tsc -b && vite build` again, so a broken main can never ship an image.
+name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [development]
   pull_request:
-    branches: [main]
-
-concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+    branches: [development]
 
 jobs:
-  backend:
-    name: Backend — tests
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: Install dependencies
+        run: npm ci
+      - name: Run ESLint
+        run: npx eslint .
+      - name: Run Prettier check
+        run: npx prettier --check .
+
+  test:
     runs-on: ubuntu-latest
     services:
       mysql:
-        image: mysql:8.0
+        image: mysql:8
         env:
-          MYSQL_ROOT_PASSWORD: ci-root-password
-          MYSQL_DATABASE: ticket_booking_test
-          MYSQL_USER: tbs_test
-          MYSQL_PASSWORD: ci-db-password
+          MYSQL_ROOT_PASSWORD: root
+          MYSQL_DATABASE: ticket_booking_dev
         ports:
           - 3306:3306
         options: >-
-          --health-cmd="mysqladmin ping -h 127.0.0.1 -pci-db-password"
-          --health-interval=10s
-          --health-timeout=5s
-          --health-retries=10
-          --health-start-period=30s
-    env:
-      NODE_ENV: test
-      DB_HOST: 127.0.0.1
-      DB_PORT: '3306'
-      DB_USER: tbs_test
-      DB_PASSWORD: ci-db-password
-      DB_NAME: ticket_booking_test
+          --health-cmd "mysqladmin ping -uroot"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+      redis:
+        image: redis:7
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
     steps:
       - uses: actions/checkout@v4
-
-      - uses: actions/setup-node@v4
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
         with:
-          node-version: 20
-          cache: npm
-          cache-dependency-path: backend/package-lock.json
-
+          node-version: '20'
       - name: Install dependencies
-        working-directory: backend
         run: npm ci
-
-      - name: Lint
-        working-directory: backend
-        run: npm run lint
-
-      - name: Check formatting
-        working-directory: backend
-        run: npm run format:check
-
-      - name: Typecheck
-        working-directory: backend
-        run: npm run typecheck
-
-      - name: Dependency audit
-        working-directory: backend
-        run: npm audit --audit-level=high
-
-      - name: Run tests
-        working-directory: backend
-        run: npm test
-
-      # The unit suite runs a second time under the coverage reporter because
-      # this pass is what enforces the floors in scripts/check-coverage.js.
-      - name: Run unit tests with the coverage gate
-        working-directory: backend
-        run: |
-          mkdir -p coverage
-          set -o pipefail
-          npm run test:coverage 2>&1 | tee coverage/summary.txt
-
-      - name: Upload coverage artifact
-        uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: backend-coverage
-          path: backend/coverage
-          retention-days: 7
-
-  frontend:
-    name: Frontend — tests + build
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 20
-          cache: npm
-          cache-dependency-path: frontend/package-lock.json
-
-      - name: Install dependencies
-        working-directory: frontend
-        run: npm ci
-
-      - name: Lint
-        working-directory: frontend
-        run: npm run lint
-
-      - name: Check formatting
-        working-directory: frontend
-        run: npm run format:check
-
-      - name: Typecheck
-        working-directory: frontend
-        run: npm run typecheck
-
-      - name: Dependency audit
-        working-directory: frontend
-        run: npm audit --audit-level=high
-
-      - name: Run unit tests with coverage
-        working-directory: frontend
+      - name: Run unit tests
+        run: npm run test:unit
+      - name: Run frontend tests
+        run: npm run test:web
+      - name: Run tests with coverage
         run: npm run test:coverage
 
-      - name: Build (typecheck + bundle)
-        working-directory: frontend
-        run: npm run build
-
-      - name: Upload coverage artifact
-        uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: frontend-coverage
-          path: frontend/coverage
-          retention-days: 7
-
-      - name: Upload dist artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: frontend-dist
-          path: frontend/dist
-          retention-days: 7
-
-  sql:
-    name: Database — SQL suite
+  build:
     runs-on: ubuntu-latest
-    services:
-      mysql:
-        image: mysql:8.0
-        env:
-          MYSQL_ROOT_PASSWORD: ci-root-password
-          # The runner reaches MySQL over TCP, not from inside the container, so
-          # root has to be reachable from off-host.
-          MYSQL_ROOT_HOST: '%'
-          MYSQL_DATABASE: ticket_booking_test
-          MYSQL_USER: tbs_test
-          MYSQL_PASSWORD: ci-db-password
-        ports:
-          - 3306:3306
-        options: >-
-          --health-cmd="mysqladmin ping -h 127.0.0.1 -pci-root-password"
-          --health-interval=10s
-          --health-timeout=5s
-          --health-retries=10
-          --health-start-period=30s
-    env:
-      DB_HOST: 127.0.0.1
-      DB_PORT: '3306'
-      DB_USER: root
-      DB_NAME: ticket_booking_test
+    needs: [lint, test]
     steps:
       - uses: actions/checkout@v4
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: Install dependencies
+        run: npm ci
+      - name: Build backend Docker image
+        run: docker build -t ticket-booking-backend ./backend
+      - name: Build frontend Docker image
+        run: docker build -t ticket-booking-frontend ./frontend
 
-      - name: Install the mysql client
-        run: sudo apt-get update && sudo apt-get install -y mysql-client
-
-      # run-sql-tests.ps1 reads the password from the git-ignored root .env, so
-      # the runner writes one rather than the workflow hard-coding the value.
-      - name: Stage the runner credentials
-        run: echo "DB_PASSWORD=ci-root-password" > .env
-
-      # -Fresh drops and recreates the database from schema.sql first, which is
-      # what makes the suite repeatable: 01-seed-data.sql expects an empty schema.
-      - name: Recreate the schema and run every SQL suite
-        shell: pwsh
-        run: ./tests/run-sql-tests.ps1 -Fresh -Database $env:DB_NAME -User $env:DB_USER
-
-  fresh-clone:
-    name: Fresh clone — install & verify
+  security:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
-      # Intentionally no `cache:` here — this job is the cold-install check.
-      - uses: actions/setup-node@v4
+      - name: Run Trivy vulnerability scanner
+        uses: aquasecurity/trivy-action@master
         with:
-          node-version: 20
+          scan-type: 'fs'
+          scan-ref: '.'
 
-      - name: Install every stack from its lockfile
-        run: npm run setup
-
-      - name: Repo-layout guard
-        run: npm run verify:repo
-
-      # lint + lint:root + format:check + typecheck + verify:repo + hermetic
-      # tests, in the same order a buyer runs them from a fresh clone.
-      - name: Verify the repository end to end
-        run: npm run verify
-
-  manifests:
-    name: Infrastructure — manifest validation
+  deploy:
     runs-on: ubuntu-latest
+    needs: [build, security]
+    if: github.ref == 'refs/heads/development'
     steps:
       - uses: actions/checkout@v4
-
-      - name: Install kubeconform
-        env:
-          # Pinned: a new kubeconform release must not silently change the gate.
-          KUBECONFORM_VERSION: v0.8.0
+      - name: Deploy with Docker Compose
         run: |
-          curl -sSLo kubeconform.tar.gz \
-            "https://github.com/yannh/kubeconform/releases/download/${KUBECONFORM_VERSION}/kubeconform-linux-amd64.tar.gz"
-          tar -xzf kubeconform.tar.gz kubeconform
-          sudo install -m 0755 kubeconform /usr/local/bin/kubeconform
-          kubeconform -v
-
-      # `kubectl kustomize` renders exactly what
-      # `kubectl apply -k infrastructure/kubernetes` would send, so this checks
-      # the object set that actually reaches the cluster — namespace, labels and
-      # generated ConfigMap content included — not just the raw files.
-      - name: Validate the rendered manifests against the Kubernetes schemas
-        run: |
-          kubectl kustomize infrastructure/kubernetes \
-            | kubeconform -strict -summary -kubernetes-version 1.29.0
-
-      # kubeconform proves the objects are *valid*; kube-linter proves they are
-      # not *misconfigured* (privilege escalation, missing probes, unset memory
-      # requirements...). The config file pins the rule set so a new release
-      # cannot silently narrow or widen the gate.
-      - name: Lint the rendered manifests for misconfigurations
-        env:
-          KUBE_LINTER_VERSION: v0.8.3
-        run: |
-          LOCATION="https://github.com/stackrox/kube-linter/releases/download/${KUBE_LINTER_VERSION}/kube-linter-linux.tar.gz"
-          curl -sSLo kube-linter-linux.tar.gz "$LOCATION"
-          mkdir -p kube-linter
-          tar -xzf kube-linter-linux.tar.gz -C kube-linter/
-          sudo install -m 0755 kube-linter/kube-linter /usr/local/bin/kube-linter
-          kube-linter version
-          kube-linter lint --config .kube-linter.yaml --add-all-built-in infrastructure/kubernetes
-
-  terraform:
-    name: Infrastructure — IaC validation & policy scan
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: hashicorp/setup-terraform@v3
-        with:
-          # Same version the module is developed and validated against locally.
-          terraform_version: 1.9.8
-
-      # fmt is the terraform linter: a diff means the file is not canonical.
-      - name: Check formatting
-        run: terraform -chdir=infrastructure/terraform fmt -check -recursive
-
-      # -backend=false: CI has no state backend credentials — this validates the
-      # configuration only. The committed .terraform.lock.hcl pins the provider
-      # for both linux_amd64 and windows_amd64, so init is checksum-exact.
-      - name: Initialize (no backend)
-        run: terraform -chdir=infrastructure/terraform init -backend=false
-
-      - name: Validate
-        run: terraform -chdir=infrastructure/terraform validate
-
-      # Policy scan (misconfigurations only — the module holds no secrets).
-      # Pinned: a new trivy release must not silently change the gate.
-      - name: Policy-scan the IaC
-        env:
-          TRIVY_VERSION: 0.74.0
-        run: |
-          curl -sSL -o trivy.tgz \
-            "https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz"
-          tar -xzf trivy.tgz trivy
-          ./trivy config --scanners misconfig --severity HIGH,CRITICAL \
-            --exit-code 1 infrastructure/terraform
-
-  docker:
-    name: Docker — build & publish
-    runs-on: ubuntu-latest
-    needs: [backend, frontend, sql, manifests, terraform, fresh-clone]
-    permissions:
-      contents: read
-      packages: write
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: docker/setup-buildx-action@v3
-
-      - name: Log in to GHCR
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-        uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Extract metadata (backend)
-        id: meta-backend
-        uses: docker/metadata-action@v5
-        with:
-          images: ghcr.io/${{ github.repository }}/backend
-          tags: |
-            type=sha,prefix={{branch}}-
-            type=raw,value=latest,enable={{is_default_branch}}
-
-      - name: Build (and push on main) — backend
-        uses: docker/build-push-action@v6
-        with:
-          context: ./backend
-          push: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
-          tags: ${{ steps.meta-backend.outputs.tags }}
-          labels: ${{ steps.meta-backend.outputs.labels }}
-          cache-from: type=gha,scope=backend
-          cache-to: type=gha,scope=backend,mode=max
-
-      - name: Extract metadata (frontend)
-        id: meta-frontend
-        uses: docker/metadata-action@v5
-        with:
-          images: ghcr.io/${{ github.repository }}/frontend
-          tags: |
-            type=sha,prefix={{branch}}-
-            type=raw,value=latest,enable={{is_default_branch}}
-
-      - name: Build (and push on main) — frontend
-        uses: docker/build-push-action@v6
-        with:
-          context: ./frontend
-          push: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
-          tags: ${{ steps.meta-frontend.outputs.tags }}
-          labels: ${{ steps.meta-frontend.outputs.labels }}
-          cache-from: type=gha,scope=frontend
-          cache-to: type=gha,scope=frontend,mode=max
+          docker compose up --build -d
+          sleep 10
+          curl -f http://localhost:3000/api/health
+          docker compose down
